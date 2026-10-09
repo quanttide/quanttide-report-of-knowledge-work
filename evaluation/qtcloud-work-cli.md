@@ -1,63 +1,107 @@
-# 意图审查：qtcloud-work CLI（apps/qtcloud-work/src/cli/）
+# 评估：qtcloud-work CLI（apps/qtcloud-work/src/cli/）
 
-审查日 2026-10-08，crate `qtcloud-work-cli` 0.1.0-beta.2。
+基线 `c37f9d4`，crate `qtcloud-work-cli` 0.1.0-beta.2。规格正本：`quanttide-specification-of-knowledge-work`；工具箱正本：`quanttide-work-toolkit`。评估日 2026-10-09。
 
-## 结论
+四个篇幅照元工程的四步走：业务需求是说清这是什么生意，编程意图是说清作者打算怎么搭，形式化推理是把领域写成可检查的结构，代码实现是结构怎么落成 Rust。前三篇从规格与仓库文档取证，第四篇从源码取证；末篇记与形式化对不上的地方。审查明细与处置见 `plan/qtcloud-work-cli.md`。
 
-最可能的原始意图是把一次知识工作拆成「定位—执行—落盘」三段，并让每件事只住一处。整体偏移中等：主流程成立，唯一一处真环是 `order` 与 `prompts` 互引；最该先处理的是把这两者拆开，随后把「读路径不写盘」这条纪律在代码与测试上落实。
+## 一、业务需求
 
-## 意图假设
+真正难的是三件事：做法散在人的习惯里、过程不可验收、账目不可追溯。知识工作是把未定形的输入做成可验收的产出，并沿途把做法沉淀成可复用的流程（规格·intro）——这个 CLI 是这套说法在命令行上的第一个实现。
 
-- 核心目标：一条命令进来，先定位（工作区根 / 账本 / 工作流目录 / 产物落点），再交给管这件事的那件处理，结果包成统一信封印出。
-- 边界：管内容的不碰盘、碰盘的不定内容；跨聚合只做一件事的单独放；接口与外边界归适配层；位置不进模型，工单文件里不写路径。
-- 约束：单文件不超过 250 行；聚合不依赖领域服务，聚合与服务不依赖入口层；只读动作不落盘。
-- 已知假设：`CONTRIBUTING.md`、`docs/dev-guide`、`README.md` 里声明的规矩即作者意图，代码应照着它走；`workspace` 是 `workorder` 的上级容器，容器与内件互认是常态。
-- 不确定性：`order` 与 `prompts` 该朝哪边拆、造话术与调 AI 该住哪层。
+产品由三个词撑起。工作流是定义：一串有序步骤，每步写着谁做（`agent` 或 `human`）与怎么算完。工单（规格里叫工作任务）是一次行程：封面写走哪条工作流，内页是只增不改的流水。判据是「怎么算完」，按谁判分三类——`rule` 程序当场核、`agent` 智能体照判准审、`human` 留给人拍板。
 
-## 偏移清单（按严重度排序）
+形态与用户：本地文件驱动，底座是仓库里的 YAML 与 Markdown；不启服务、不连数据库、不驻后台。主要使用者是 AI，所以命令面为 AI 设计——每个动作都出 `--json`，写入型动作都能 `--dry-run`，结果走标准输出、提示与错误走标准错误。人管两处：拍板放行，以及定义工作流。四处位置（工作区根、账本、工作流目录、产物落点）都有缺省，也可由启动参数装载；位置不进模型。
 
-1. [严重] 聚合与适配互相引用 order ↔ prompts — src/order/ai.rs:5
-   证据：`order/ai.rs` 用 `crate::prompts` 的 `Facts` / `prompt_for` / `judge_prompt` / `previous_records`（`:5`、`:12`、`:43`、`:157`）；`src/prompts.rs:94` 又用 `crate::order::WorkRecord`。前向边起于 `2cc2e41`（按聚合/服务/适配立目录），反向边起于 `e689df7`（task 拆工单与工作记录），此前 `prompts.rs` 只引 `criterion`。
-   与意图的关系：`order` 是聚合、`prompts` 是给智能体的话术，两者不该有依赖。
+业务上算做成了的判据是一条：同一件事能被写成一条工作流，换个人或换个智能体照着走一遍，结果对得上；每一步过没过都留了账；产物最后经人验收。
 
-2. [严重] 只读命令会开账本，「读路径不写盘」被证伪 — src/workspace/local.rs:146
-   证据：`workflow show` 调 `WorkflowFile::credentialed()`（src/workflow/mod.rs:78），它调 `workspace_id()`（src/workspace/local.rs:146），后者调 `ensure()`（src/workspace/local.rs:111）建目录、写 `workspace.yaml`、发 `WorkspaceCreated`。实测：`--workflows` 指一个外部目录、`--data` 指一个空目录，跑 `workflow show 试` 后空目录里出现 `workspace.yaml`、`events.jsonl`、`workorders/`。测试 `tests/run_context.rs:87` 只跑空账本上的 `order list`，触发不到这条路径，空过。
-   与意图的关系：与 `src/workspace/local.rs:145`「读路径不会触发首跑写盘」及 `docs/dev-guide/workspace.md`「只读动作不开账本，不在任何根上建文件」矛盾。
+需求自带三处张力。一是单人单事与一套流程之间——治理复杂度必须匹配体量，套上多人审批就过度。二是本地文件驱动与服务化之间——规格定的是 REST 资源与领域事件，CLI 只是本地实现，同一份语言要能同时落这两侧。三是 AI 是主要使用者而验收必须留给人——这条决定了三类判据的分法，而不是反过来。
 
-3. [中] 聚合依赖领域服务 order → audit — src/order/execute.rs:47
-   证据：`:47`、`:48`、`:136`、`:137` 调 `crate::audit::items_of` 与 `crate::audit::run`；`items_of` 只是 `criterion` 的转出（src/audit/mod.rs:23）。`tests/contract.rs` 只钉入口方向，无断言拦。
-   与意图的关系：与「聚合不得依赖服务」矛盾；规则执行做成服务、聚合又要调它，属设计张力。
+## 二、编程意图
 
-4. [其他] 仓库文档仍按已不存在的 `locate/` 叙述 — CONTRIBUTING.md
-   证据：代码里装载是 `src/workspace/local.rs` 的 `LocalWorkspace`，`workspace` 是 `workorder` 的上级容器，两条互认是常态（`order` 引 `LocalWorkspace`，`LocalWorkspace::order_file` 收 `&WorkOrder`）。`CONTRIBUTING.md`、`docs/dev-guide/index.md`、`docs/dev-guide/workspace.md` 仍写 `locate/`，并断言「workspace 一件也不引 order」，`STATUS.md` 也按 `locate` 记账。
-   与意图的关系：文档与现实脱节，改文档即可，不是依赖问题。
+一句话：一次命令进来，先定位（工作区根、账本、工作流目录、产物落点），再交给管这件事的那一件，结果包成统一信封印出。
 
-5. [其他] 两处 `short` 各写一份，实现还不一样 — src/workspace/local.rs:214
-   证据：`catalog` 另有一份 `short`（src/catalog/mod.rs:84，用于 `:78`、`:204`）；`workspace` 按字符串前缀剥，`catalog` 按 `Path::strip_prefix` 剥。
-   与意图的关系：无依据的重复，与「每件事只住一处」相左。
+三类落位，判据是「有没有自己的定义」。有自己的定义（身份、生命周期、字段规矩）的单开聚合——`order`、`workflow`、`catalog`、`artifact`、`material`、`workspace`；没有自己的定义、只跨聚合做一件事的进领域服务——`search`、`audit`；边界外的东西与入口进适配——`cli`、`help`、`prompts`、`workers`、`adapters`、`health`、`events`。
 
-6. [其他] 事件负载两套形状 — src/workflow/events.rs:26
-   证据：工单事件把整份 YAML 转 JSON 带上（`src/order/events.rs`），工作流事件的 `to_json` 只留每条判据的 `executor` 与 `description`，`path` / `absent` / `file` / `contains` / `run` 丢弃，注释却写「带声明全文与派生出的凭证」。
-   与意图的关系：同一意图两处做法与说法不一致。
+四条横切约束（`CONTRIBUTING.md`）：依赖单向，服务可依赖聚合，聚合不依赖服务，聚合与服务都不依赖入口层；位置不进模型，工单文件里不写路径，同一份定义到哪都能跑；事件归聚合自己发，聚合定事件名与负载形状，适配层只补公共三字段、拼行、追加；单文件不超过 250 行，超阈即按事拆分，拆时行为不变。
 
-7. [其他] 失效注释 — src/criterion/model.rs:96
-   证据：指向 `crate::task::execute`，全库已无 `crate::task`。
-   与意图的关系：无依据，属重构残留。
+两条对齐纪律：与 studio 对表只比 `ok` / `columns` / `rows` / `data` 四样，`lines` 是给人看的那一栏，两侧措辞可以不同；领域模型随聚合并回本仓，不因平台而变的那部分归工具箱。
 
-8. [其他] `criterion` 自称聚合，与分类不符 — src/criterion/mod.rs:1
-   证据：模块注释写「判据聚合」；`CONTRIBUTING.md` 把 `criterion` 列为中立领域模型（无身份、无生命周期）。
-   与意图的关系：名与类不符，命名归用户。
+意图与现状的偏差。旧一批已清：`order` 与 `prompts` 已脱钩（造话术与调 AI 移进 `workers/` 与 `adapters/`，`prompts` 只认 `criterion`），`order` 不再调 `audit`（判据的执行落在 `order/rules.rs`），两处 `short` 合为一处，文档里的 `locate/` 已改成 `workspace` 容器事实，契约测试改扫 `src/` 自动收集，只读纪律按 ADR-0001 收窄成四条只读动作。现在还欠的是名与类：`criterion` 模块自称「判据聚合」（`src/criterion/mod.rs` 首行），按三类落位它没有身份、没有生命周期，是中立模型。
 
-9. [其他] 契约测试清单重复且手维护 — tests/contract.rs:169
-   证据：`workspace/events.rs`、`workspace/mod.rs`、`workspace/model.rs` 各重复一次（42 个唯一项列成 45 条）；新增文件不会自动纳入检查。
-   与意图的关系：规则覆盖范围收窄，与「有测试钉住」的声明不符。
+## 三、形式化推理
 
-## 建议
+### 本体与模型
 
-先拆偏移 1：把 `previous_records` 移出 `prompts`，把造话术、调 pi、审从 `order/ai.rs` 移到适配层，让两个方向都不再互引。
+存在四组东西（规格·intro）：场所（工作台、工作区）、工件（材料、产物）、过程（工作流、工作步骤、工作任务、工作记录）、执行者（人类、智能体、规则引擎）。
 
-接着处理偏移 2：要么让凭证派生不再落盘地取工作区 id，要么把「只读动作不开账本」改成事实，并补一条 `workflow show` 的只读测试，别只测空账本上的 `order list`。
+模型分两侧。定义侧是人写的正本，写意图，不带凭证；事实侧是程序写的账本，写交代，带凭证。工作区是作用域——区内按名字互相引用，名字的辖区就是工作区。
 
-偏移 3 属设计取舍：给「聚合可调某些服务」开口子并把方向写进规范，或者把规则执行挪到能被单向依赖的层。
+模型的特征是成对：材料与产物是前后衔接的两态；工作流与工作任务是一份定义与多趟行程；工作步骤与工作记录是一对镜像——步骤向前说打算，记录向后说交代。
 
-偏移 4 到 9 为改文档与清理项：把 `locate/` 改成 `workspace` 容器事实、合并两处 `short`、统一事件负载形状、删失效注释、把 `criterion` 的名与类对齐、把契约测试清单改成扫目录自动收集。命名部分由用户定去留。
+| 存在物 | 侧 | 名字 | 凭证 | 可变性 |
+| :-- | :-- | :-- | :-- | :-- |
+| 工作区 | 场所 | `name`（区内唯一） | `id`（uuid4） | 封面可改 |
+| 材料 | 工件·入口 | 路径 | — | — |
+| 产物 | 工件·出口 | 名字 + 类别 | — | — |
+| 工作流 | 定义 | `name`（区内唯一） | `id`（uuid5 派生） | 未被引用即可改 |
+| 工作步骤 | 定义 | `name`（流内唯一） | `id`（分层派生） | 随工作流冻结 |
+| 工作任务 | 事实 | `name`（区内唯一） | `id`（uuid4） | 封面落笔即封 |
+| 工作记录 | 事实 | 无（认 `seq`） | `id`（uuid4） | 只增不改 |
+
+### 关系
+
+四组东西之间只有四条边。
+
+归属是多对一：材料、产物、工作流、工作任务都归属一个工作区，且只归属一个。引用按名加双锚：工作任务引工作流存 `workflow` 名与 `workflow_id` 号，工作记录引工作步骤存 `step` 名与 `step_id` 号——区内认名，跨边界认号。派生是函数：工作区 `id` 加工作流名算出工作流凭证，工作流凭证加步骤名算出步骤凭证（uuid5，命名空间钉死）。对账是推导：流水对定义逐站比对，得进度与完结。
+
+凭证的造号与锚定是这套关系里最讲究的一处（ADR-0001）。定义侧按 uuid5 派生造号，凭证不写进定义；事实侧由程序发 uuid4。派生的凭证首次落盘即锚定——锚定前它只是名字的推论，改名即换推论；锚定后终身不变，改名不换凭证，旧名随旧号占坑。派生输入必须含工作区 `id`，否则两个区的同名工作流撞成同一枚凭证。
+
+事件是这四条边的通知出口，不是边本身——`WorkspaceCreated`、`WorkflowCreated`、工作任务的创建、`WorkRecorded`，加规格里的材料已收录与产物已生成、已验收。负载只指认 `id`、名与时刻，正文凭 `id` 回读；同一 `id` 的重放视作重放。事件是通知不是正本，两处说法打架以正本为准。
+
+### 公理
+
+规格逐条写着的不变量，落成代码时是校验、是推导、还是纪律，第四篇再看。
+
+1. 归属唯一——任何材料、产物、工作流、工作任务必须且只能归属一个工作区；
+2. 区间隔绝——工作区之间默认互不可见，跨区须显式导出或导入；
+3. 封面落笔即封——工作任务的 `workflow`、`workflow_id`、`description` 一经创建不可改；
+4. 流水只增不改——修改、删除、重排均违规，改结论只能追加，旧记录原样保留；
+5. 凭证与页码各守其职——同一 `id` 不得两条，同一 `seq` 不得两条，`seq` 自 1 起严格递增不跳号；
+6. 时间不倒流——新记录的 `created_at` 不得早于末条；
+7. 进度与完结只许推导——任何把推导结论写回字段的动作不合语法；
+8. 定义随引用冻结——工作流一经工作任务引用即不可变，`name` 尤其不可动（对账靠名字）；
+9. 凭证入账即锚、永不重发——定义不写凭证，绑定由「名 → 号」的登记持有；
+10. 字段之外一律拒绝——不认识的字段、缺必填字段、取值不在枚举内，均不合语法；
+11. 有账不销——流水非空的工作任务不可删，删只删白纸；
+12. 位置不进模型——工件在物理上从哪来、落在哪，由平台在装载时决定；
+13. 事件是通知不是正本——信可丢、可重放，下游按 `id` 幂等消化。
+
+### 范畴
+
+同一批存在物按四个轴各自归类，四个轴彼此独立，交叉起来才是完整坐标。
+
+按定义与事实分：声明侧（工作流、工作步骤）与执行侧（工作任务、工作记录）。按谁写分：人写的（工作流定义、材料、产物内容）与程序写的（工作区身份、工作任务、工作记录、事件）。按这条规矩说的是什么分：状态（字段与取值）、关系（归属、引用）、动作（开单、走一步、放行、导出导入）。按谁判分：`rule` 程序当场核、`agent` 智能体审、`human` 人拍板。
+
+用范畴论的话说：对象是四组存在物，态射是归属、引用、派生、对账四条边。四条边里只有派生是可计算的函数（同一组输入永远算出同一枚），对账是推导（结论随时可重算、不落字段），归属与引用是结构（写成字段落盘，或写成端点暴露）。这个分布决定了代码里哪些东西必须有字段、哪些只能有函数——第四篇的取舍大半由它推出来。
+
+## 四、代码实现
+
+形式化到 Rust 的关键取舍，只到项目里有哪些结构体、函数怎么连，不进算法内部。
+
+集合落成类型。存在物一件一个结构体：`WorkOrder`、`WorkRecord`、`Workflow`、`Step`、`Workspace`、`Material`、`Artifact`、`Criterion`；聚合的入口是握着装载、内容与所引定义三样的 `Order { locate, payload, workflow }`。关系落成 `String` 引用字段（`workflow_id`、`step_id`、`order_id`），按名的引用另存一份名字供账页直读；派生落成 `ids::derive` 这个纯函数，对账落成 `order` 的推导函数，引用在内存里的解析落成 `order::workflow_by_id` 与 `workflow::listing`。逻辑式落成校验函数：`workflow::validate` 核定义语法（字段表在 `fields.rs`），`Workflow::of` 把 YAML 读成 `Workflow`，`Order::append` 当场判时间倒序与步骤存在，`Order::delete` 判有账不销。
+
+几处 Rust 特性上的取舍最见工夫。
+
+判据落成 enum，执行者落成 `&str` 常量。`Criterion` 六个变体让「哪几个字段同时存在」成为类型事实——`PathExists` 只有 `path` 加 `description`，`FileContains` 才有 `file` 加 `contains`，非法组合写不出来。执行者反过来：`AGENT` / `RULE` / `HUMAN` 三个常量和 `EXECUTORS` / `CRITERION_TYPES` 两组名单。因为它的正本是 YAML 里的字符串，用 enum 要两头转换；代价是错值不靠类型挡，靠读定义时核名单。
+
+定义走动态 YAML，不用 `derive`。读定义是 `serde_yaml::Value` 加手写读法，而不是 `Deserialize` 的静态结构。理由是一条公理——不认识的字段一律拒绝——而 serde 默认忽略未知字段，要 `deny_unknown_fields` 且嵌套层各写一遍。手写读法把「字段表」与「拒绝」写成同一处，报错能指到位置（`error.rs` 为此单开 `DefinitionError`，一个 `String` 扛不住「第几行、哪个字段」）。代价是少了编译器的字段名检查。
+
+不变量交给类型、校验与测试三家分。类型能挡的（枚举、必填字段、`Result`）交给类型；跨记录跨文件的（`seq` 连号、区内同名、封面冻结）交给校验函数；方向性的（聚合不引服务、不引入口层）交给 `tests/contract.rs` 扫源码断言。Rust 没有模块级依赖方向的强制，这条规矩只能靠测试守。
+
+所有权承担纪律。`AgentWorker { root }` 只拿工作区根、不持工单，走一步时逐次借入 `&mut Order`——「同一时刻只有一处能改账」由借用检查器保证。`LocalWorkspace` 是 `Clone` 的值（四个 `PathBuf`），装载时复制进 `Order`，省掉一层生命周期参数；代价是每个碰盘的动作都要先有一个 `LocalWorkspace`，于是几乎所有动作函数的签名都带 `&LocalWorkspace`。
+
+错误与输出两边都从简。动作返回 `Result<_, String>`，错误是给人（和 AI）看的整句人话，换来的是不能程序化分支——只有读定义那一侧另开 `DefinitionError`，因为那里要给位置。出口统一是 `Outcome`（`ok` / `lines` / `columns` / `rows` / `data`），适配层的 `emit` 决定怎么印，`data` 是 `Option<serde_json::Value>`，不拘形状。
+
+入口与分派是薄的一层。`main.rs` 一行调 `cli::run_from_env`；`Cli` 是 clap derive 的结构体（四处位置与几个开关都 `global = true`），命令面落成嵌套枚举 `Command` → `OrderCommand` / `WorkflowCommand`；`cli/handlers/*` 按命令分派，装载一次 `LocalWorkspace` 交给各动作。事件用「函数加约定」而不是 trait：各聚合的 `events.rs` 定事件名与负载，`crate::events::append` 补公共三字段并追加 JSONL——抽一个「可发事件的聚合」 trait 要引入泛型与对象安全话题，而这里只有四个事件、一处落盘。
+
+与形式化对不上的地方。规格今天把 `work-order` 改名 `work-task`（工单改叫工作任务），代码还停在旧名上——目录 `order/`、类型 `Order` 与 `WorkOrder`、事件 `WorkOrderCreated` 都是；改名是改规格之后的跟手活。规格里的材料已收录、产物已生成与已验收两类事件，代码里一个都没有，现在只有工作区、工作流、工作任务、工作记录四个事件。ADR-0001 的「登记处比对」与「失配绑定」在端侧还没落成：凭证现算，落盘只落工单封面与事件负载，ADR-0001 里的改名改绑端点也没有对应命令。
